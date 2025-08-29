@@ -1,21 +1,19 @@
-# app.py — Nykra CAC/Ad Spend backend
-# - Price-aware (setup vs monthly) + recurring_price field
-# - Platform-aware CPC/conv (Meta vs Google) by business type/ticket size
-# - Beginner-first output with deterministic opening math (no guessing prices)
-# - Recurring-aware plan (front-load spend, taper later)
+# app.py — Nykra CPA/CAC Calculator (deterministic math + archetype plans)
+# - Section 1 (ROAS per platform) computed here (no model math)
+# - GPT writes Sections 2–5 using our numbers & guardrails
 
-import os, re, statistics
+import os, re, statistics, math
 from typing import Optional, List, Tuple, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from openai import OpenAI
 
-# ---- Config ----
+# ---------- Config ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
-LTV_MONTHS = int(os.getenv("LTV_MONTHS", "6"))  # use 6 by default; change to 12 if you prefer
+LTV_MONTHS = int(os.getenv("LTV_MONTHS", "6"))  # change to 12 if you prefer
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -31,21 +29,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Payload (matches your form; added recurring_price) ----
+# ---------- Payload ----------
 class AnalyzePayload(BaseModel):
     name: str
     email: EmailStr
     business_url: Optional[str] = None
     business_location: Optional[str] = None
     business_description: Optional[str] = None
-    offer: Optional[str] = None                 # "Product, Service, Experience, Subscription"
+    offer: Optional[str] = None                 # "Product, Service, Experience, Subscription" (comma-joined)
     offer_details: Optional[str] = None
-    item_price: Optional[str] = None            # free-text; may contain setup/monthly phrases
+    item_price: Optional[str] = None            # free text (may include multiple numbers)
     recurring_price: Optional[str] = None       # NEW: explicit recurring amount text
     expected_profit: Optional[str] = None
     recurring: Optional[str] = None
     current_ad_spend: Optional[str] = None
-    ad_platforms: Optional[str] = None
+    ad_platforms: Optional[str] = None          # e.g., "Meta, Google, TikTok"
     struggle: Optional[str] = None
 
 # ---------- helpers ----------
@@ -67,7 +65,6 @@ def _near(s: str, idx: int, window: int = 22) -> str:
     return s[a:b].lower()
 
 def _extract_first_amount(text: Optional[str]) -> Optional[float]:
-    """Pull first numeric amount from a simple field like recurring_price."""
     if not text:
         return None
     for val, _ in _nums_in(text):
@@ -76,15 +73,13 @@ def _extract_first_amount(text: Optional[str]) -> Optional[float]:
 
 def _parse_price_details(item_price_text: Optional[str], recurring_text: Optional[str]) -> Dict[str, Optional[float]]:
     """
-    Determine upfront (setup), monthly (recurring), and avg_sale used for CAC/ROAS-at-purchase.
+    Determine upfront (setup), monthly (recurring), and avg_sale for ROAS-at-purchase.
     Priority:
-      1) Use explicit recurring_price field (if present) for monthly.
-      2) From item_price_text, label numbers near 'setup/upfront/project/website/refresh' as upfront.
-         Label numbers near 'month/mo/monthly/maintenance/retainer' as monthly.
-      3) Fallbacks: upfront = largest number >= 200; monthly = median of numbers 30..1500 not equal to upfront.
-      4) avg_sale = upfront if present else median of all numbers.
+      - upfront: numbers labelled near setup/upfront/project/website/refresh/initial; fallback largest >= 200
+      - monthly: explicit recurring_price if given; else labelled near month/mo/maintenance/retainer/subscription; fallback 30..1500 not equal to upfront
+      - avg_sale: upfront if present else median of all numbers
     """
-    upfront_keys = ["setup", "upfront", "project", "website", "refresh", "one-off", "once", "initial"]
+    upfront_keys = ["setup", "upfront", "project", "website", "refresh", "initial", "one-off", "once"]
     monthly_keys = ["per month", "month", "mo", "monthly", "maintenance", "retainer", "subscription"]
 
     s = item_price_text or ""
@@ -105,7 +100,7 @@ def _parse_price_details(item_price_text: Optional[str], recurring_text: Optiona
     if recurring_explicit is not None:
         monthlies = [recurring_explicit]
 
-    # Fallback labeling if empty
+    # Fallbacks
     if not upfronts:
         upfronts = [v for v, _ in pairs if v >= 200]
     if not monthlies:
@@ -134,22 +129,12 @@ def _parse_price_details(item_price_text: Optional[str], recurring_text: Optiona
     return {"upfront": upfront, "monthly": monthly, "avg_sale": avg_sale}
 
 def _fmt_money(x: float) -> str:
-    return f"${x:,.0f}"
-
-def _is_service(offer: Optional[str], desc: Optional[str]) -> bool:
-    s = " ".join([offer or "", desc or ""]).lower()
-    return any(k in s for k in [
-        "service", "consult", "agency", "therap", "dent", "law", "plumb", "electric",
-        "roof", "install", "setup", "maintenance", "retainer", "seo", "website", "coaching"
-    ])
-
-def _ticket_size(upfront: Optional[float], offer: Optional[str], desc: Optional[str]) -> str:
-    if upfront and upfront >= 1000: return "high"
-    s = " ".join([offer or "", desc or ""]).lower()
-    if any(k in s for k in ["retreat", "coaching", "consult", "agency", "b2b", "enterprise", "setup", "website", "seo"]):
-        return "high"
-    if upfront and upfront <= 50: return "low"
-    return "mid"
+    if x is None or math.isinf(x) or math.isnan(x):
+        return "$0"
+    if x >= 1000:
+        return "${:,.0f}".format(x)
+    # keep one decimal below 1000 if it has .5 etc.
+    return "${:,.0f}".format(x) if float(int(x)) == x else "${:,.1f}".format(x)
 
 def _platforms_list(ad_platforms: Optional[str]) -> List[str]:
     if not ad_platforms: return []
@@ -157,170 +142,352 @@ def _platforms_list(ad_platforms: Optional[str]) -> List[str]:
     plats = []
     if any(k in t for k in ["meta", "facebook", "instagram"]): plats.append("meta")
     if any(k in t for k in ["google", "search"]): plats.append("google")
-    # de-dupe
-    seen=set(); out=[]
+    if "tiktok" in t: plats.append("tiktok")
+    # de-dupe while preserving order
+    out, seen = [], set()
     for p in plats:
-        if p not in seen: seen.add(p); out.append(p)
+        if p not in seen:
+            out.append(p); seen.add(p)
     return out
 
-def _assumptions_for(platform: str, ticket: str, is_service: bool) -> Tuple[float, float]:
+def _is_service(offer: Optional[str], desc: Optional[str]) -> bool:
+    s = " ".join([offer or "", desc or ""]).lower()
+    return any(k in s for k in [
+        "service", "consult", "agency", "therapy", "therap", "dent", "law", "plumb",
+        "electric", "roof", "install", "setup", "maintenance", "retainer", "seo",
+        "website", "coaching", "psycholog", "marketing"
+    ])
+
+def _is_finite(offer: Optional[str], desc: Optional[str]) -> bool:
+    s = " ".join([offer or "", desc or ""]).lower()
+    return any(k in s for k in ["retreat", "cohort", "event", "workshop", "bootcamp", "tickets", "limited spots", "limited seats"])
+
+def _ticket_band(upfront: Optional[float], desc: Optional[str]) -> str:
+    if upfront is None:
+        # infer from words
+        s = (desc or "").lower()
+        if any(k in s for k in ["enterprise", "premium", "custom build", "solar", "sauna", "renovation", "website"]):
+            return "high"
+        return "mid"
+    if upfront < 200: return "low"
+    if upfront < 1000: return "mid"
+    if upfront < 5000: return "high"
+    return "premium"
+
+def _assumptions_for(platform: str, is_service: bool, ticket: str, finite: bool, has_recurring: bool) -> Tuple[float, float]:
     """
     Return (CPC $, conversion fraction).
-    Conservative but realistic defaults by platform + type.
+    Conservative, static heuristics (no GPT). Tuned by platform + business style.
     """
+    # Google: higher intent, pricier CPC, better conv for services/high-ticket
     if platform == "google":
+        if finite:
+            return (4.0, 0.012)                    # event keywords, moderate intent
         if is_service:
-            return (8.0 if ticket == "high" else 4.0, 0.010 if ticket == "high" else 0.015)  # 1.0–1.5%
-        else:
-            return (2.5 if ticket == "low" else 3.5, 0.018 if ticket == "low" else 0.012)
-    # meta (facebook/instagram)
-    if is_service:
-        return (3.0 if ticket == "high" else 2.2, 0.004 if ticket == "high" else 0.008)       # 0.4–0.8%
-    else:
-        return (1.4 if ticket == "low" else 1.8, 0.010 if ticket == "low" else 0.012)
+            if ticket in ("high", "premium"): return (8.0, 0.015)   # 1.5%
+            if ticket == "mid": return (4.5, 0.015)
+            return (3.0, 0.012)
+        # ecommerce
+        if ticket == "low": return (2.0, 0.012)
+        return (3.0, 0.012)
 
-def _platform_opening_lines(p: AnalyzePayload) -> str:
-    loc = p.business_location or "your region"
+    # Meta: cheaper CPC, lower initial conv; finite offers convert better with urgency
+    if platform == "meta":
+        if finite: return (2.5, 0.012)             # urgency helps
+        if is_service:
+            if ticket in ("high", "premium"): return (3.2, 0.004)   # 0.4%
+            return (2.2, 0.008)                    # 0.8%
+        # ecommerce
+        if ticket == "low": return (1.2, 0.010)    # 1.0%
+        return (1.8, 0.012)
+
+    # TikTok: low CPC, lower conv unless visual/lifestyle or finite
+    if platform == "tiktok":
+        if finite: return (1.6, 0.010)
+        if is_service:
+            if ticket in ("high", "premium"): return (2.0, 0.0035)
+            return (1.6, 0.006)
+        # ecommerce
+        if ticket == "low": return (0.9, 0.008)
+        return (1.2, 0.009)
+
+    # Default fallback
+    return (2.0, 0.010)
+
+def _best_intent_platform(is_service: bool, ticket: str, finite: bool) -> str:
+    # choose most likely "intent winner" for initial 60/40 split
+    if finite:
+        return "meta"
+    if is_service or ticket in ("high", "premium"):
+        return "google"
+    return "meta"
+
+def _safe_float(s: Optional[str]) -> Optional[float]:
+    if not s: return None
+    try:
+        # pull first number if it's a string like "$500"
+        vals = _nums_in(s)
+        return vals[0][0] if vals else None
+    except: return None
+
+# ---------- core builders ----------
+def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
+    """
+    Compute Section 1 lines and return (html_lines, meta dict with numbers for later sections).
+    """
     price_info = _parse_price_details(p.item_price, p.recurring_price)
     upfront = price_info["upfront"]
     monthly = price_info["monthly"]
     avg_sale = price_info["avg_sale"]
-
-    is_srv = _is_service(p.offer, p.business_description)
-    ticket = _ticket_size(upfront or avg_sale, p.offer, p.business_description)
+    sale_price = upfront or avg_sale
+    has_recurring = monthly is not None
 
     plats = _platforms_list(p.ad_platforms)
+    is_srv = _is_service(p.offer, p.business_description)
+    finite = _is_finite(p.offer, p.business_description)
+    ticket = _ticket_band(sale_price, p.business_description)
+
     if not plats:
-        plats = ["google"] if is_srv else ["meta"]
+        # Default platform if none provided:
+        plats = ["google"] if is_srv or ticket in ("high", "premium") else ["meta"]
 
-    lines = []
-    verdicts = []
+    rows = []
+    meta = {"platforms": []}
+    location = p.business_location or "your region"
+
     for plat in plats:
-        cpc, conv = _assumptions_for(plat, ticket, is_srv)
-        clicks_per_sale = int(round(1/conv)) if conv > 0 else 0
-        cac = cpc/conv if conv > 0 else 0
+        cpc, conv = _assumptions_for(plat, is_srv, ticket, finite, has_recurring)
+        clicks_per_sale = int(round(1 / conv)) if conv > 0 else 0
+        cac = (cpc / conv) if conv > 0 else None
 
-        # Use upfront (setup) if present; else avg_sale; never invent values.
-        sale_price = upfront or avg_sale
+        roas = (sale_price / cac) if (sale_price and cac) else None
+        ltv = (sale_price + LTV_MONTHS * monthly) if (sale_price and monthly is not None) else None
+        ltv_roas = (ltv / cac) if (ltv and cac) else None
+
+        verdict = None
+        if roas is not None: verdict = "worth testing" if roas >= 1.0 else "not worth it yet"
+
+        line = f"- <b>{plat.title()}</b> in {location}: CPC ≈ {_fmt_money(cpc)}, conv ≈ {conv*100:.1f}% → ~{clicks_per_sale} clicks ≈ CAC {_fmt_money(cac)} per sale."
         if sale_price:
-            roas = sale_price / cac if cac else 0
-            margin = sale_price - cac if cac else 0
-            worth = roas >= 1.0
-            sale_label = "setup price" if upfront else "average sale"
-            lines.append(
-                f"- **{plat.title()}** in {loc}: CPC ≈ {_fmt_money(cpc)}, conv ≈ {conv*100:.1f}% "
-                f"→ ~{clicks_per_sale} clicks ≈ CAC {_fmt_money(cac)} per sale. "
-                f"At {sale_label} {_fmt_money(sale_price)} → ROAS ≈ {roas:,.2f}x "
-                f"({'+' if margin>=0 else '−'}{_fmt_money(abs(margin))} per sale) → **{'worth testing' if worth else 'not worth it yet'}**."
-            )
-            verdicts.append((plat, roas))
+            line += f" At {'setup price' if upfront else 'sale value'} {_fmt_money(sale_price)} → ROAS ≈ {roas:,.2f}x"
+            if verdict:
+                # compute margin on purchase
+                margin = sale_price - (cac or 0)
+                sign = "+" if margin >= 0 else "−"
+                line += f" ({sign}{_fmt_money(abs(margin))} per sale) → <b>{verdict}</b>."
         else:
-            lines.append(
-                f"- **{plat.title()}** in {loc}: CPC ≈ {_fmt_money(cpc)}, conv ≈ {conv*100:.1f}% "
-                f"→ ~{clicks_per_sale} clicks ≈ CAC {_fmt_money(cac)} per sale. "
-                f"(Enter an average sale or setup price to judge ROAS precisely.)"
-            )
+            line += " Add an average sale or setup price to judge ROAS precisely."
 
-        # LTV view only if we actually have a monthly amount
-        if monthly and sale_price and cac:
-            ltv = sale_price + LTV_MONTHS * monthly
-            roas_ltv = ltv / cac
-            lines.append(f"  ↳ {LTV_MONTHS}-month LTV view: {_fmt_money(ltv)} / {_fmt_money(cac)} ≈ {roas_ltv:,.2f}x (tolerates higher CAC).")
+        if ltv_roas is not None:
+            line += f"<br/>&nbsp;&nbsp;↳ {LTV_MONTHS}-month LTV view: {_fmt_money(ltv)} / {_fmt_money(cac)} ≈ {ltv_roas:,.2f}x."
 
-    if len(verdicts) >= 2:
-        best = max(verdicts, key=lambda x: x[1]); worst = min(verdicts, key=lambda x: x[1])
-        if best[0] != worst[0]:
-            lines.append(f"→ Right now **{best[0].title()} looks stronger than {worst[0].title()}** under these assumptions.")
+        rows.append(line)
 
-    # Echo what we actually used (transparency; no hallucinated prices)
+        meta["platforms"].append({
+            "name": plat,
+            "cpc": cpc,
+            "conv": conv,
+            "clicks_per_sale": clicks_per_sale,
+            "cac": cac,
+            "roas": roas,
+            "ltv": ltv,
+            "ltv_roas": ltv_roas,
+            "verdict": verdict,
+        })
+
+    # winner/loser note
+    if len(meta["platforms"]) >= 2 and all(pl["roas"] is not None for pl in meta["platforms"]):
+        best = max(meta["platforms"], key=lambda d: d["roas"])
+        worst = min(meta["platforms"], key=lambda d: d["roas"])
+        if best["name"] != worst["name"]:
+            rows.append(f"→ Right now <b>{best['name'].title()}</b> looks stronger than {worst['name'].title()} under these assumptions.")
+
+    # Echo prices used
     echo_bits = []
-    if upfront is not None: echo_bits.append(f"setup detected: {_fmt_money(upfront)}")
-    if monthly is not None: echo_bits.append(f"recurring detected: {_fmt_money(monthly)}/mo")
-    if not echo_bits and avg_sale is not None: echo_bits.append(f"average sale used: {_fmt_money(avg_sale)}")
-    echo = f" ({' | '.join(echo_bits)})" if echo_bits else ""
+    if upfront is not None: echo_bits.append(f"setup: {_fmt_money(upfront)}")
+    if monthly is not None: echo_bits.append(f"recurring: {_fmt_money(monthly)}/mo")
+    if not echo_bits and sale_price is not None: echo_bits.append(f"average sale used: {_fmt_money(sale_price)}")
+    meta["price_used"] = {"upfront": upfront, "monthly": monthly, "sale_price": sale_price}
 
-    caveat = ("Real costs vary by industry, competition and creative. "
-              "Google is pricier but higher intent; Meta is cheaper but converts lower at first. "
-              "Treat this as a starting point and adjust with real data.")
-    header = "Simple check — CAC & ROAS\n" \
-             "This plan helps you decide ad spend and whether ads are worth it. " \
-             "CAC is what you spend to win 1 customer. ROAS is revenue ÷ ad spend." + echo
+    lines_html = "<br/>".join(rows)
+    return lines_html, meta
 
-    return header + "\n" + "\n".join(lines) + "\n" + caveat
+def choose_archetype(p: AnalyzePayload, meta: Dict) -> Dict:
+    pi = meta.get("price_used", {})
+    sale_price = pi.get("sale_price")
+    upfront = pi.get("upfront")
+    monthly = pi.get("monthly")
 
-def _build_prompt(p: AnalyzePayload) -> str:
-    opening = _platform_opening_lines(p)
+    is_srv = _is_service(p.offer, p.business_description)
+    finite = _is_finite(p.offer, p.business_description)
+    ticket = _ticket_band(sale_price, p.business_description)
+    has_recurring = monthly is not None
 
-    # Recurring-aware tip injected for the plan section
-    recurring_note = "If you have recurring revenue, expect higher spend in weeks 1–2, then taper as retention compounds." \
-                     if (p.recurring_price or ("month" in (p.item_price or "").lower())) else \
-                     "For one-off sales, concentrate spend into shorter bursts around proven creatives."
+    if finite:
+        archetype = "finite"
+        curve = [0.30, 0.40, 0.30, 0.00]  # final 72h handled in narrative
+    elif (is_srv and (ticket in ("high", "premium")) and not has_recurring):
+        archetype = "high_durable"
+        curve = [0.25, 0.25, 0.25, 0.25]
+    elif (is_srv and has_recurring):
+        archetype = "service_recurring"
+        curve = [0.15, 0.35, 0.35, 0.15]
+    elif (ticket == "low"):
+        archetype = "ecom_low"
+        curve = [0.25, 0.25, 0.25, 0.25]
+    else:
+        archetype = "generic_mid"
+        curve = [0.25, 0.25, 0.25, 0.25]
+
+    # Budget guidance
+    # min test spend per platform: aim for ~8 CACs or $300 floor
+    min_per_plat = []
+    for pl in meta["platforms"]:
+        cac = pl["cac"] or 300.0
+        min_per_plat.append(max(cac * 8.0, 300.0))
+    baseline_weekly = sum(min_per_plat) / 4.0  # spread first month test over 4 weeks
+    weekly_low = max(200.0, baseline_weekly * 0.7)
+    weekly_high = baseline_weekly * 1.3
+
+    # Platform split: 60/40 toward likely winner
+    likely = _best_intent_platform(is_srv, ticket, finite)
+    chosen = [pl["name"] for pl in meta["platforms"]] or [likely]
+    if len(chosen) == 1:
+        split = {chosen[0]: 1.0}
+    else:
+        if likely in chosen:
+            others = [c for c in chosen if c != likely]
+            if others:
+                rem = 1.0 - 0.60
+                per = rem / len(others)
+                split = {likely: 0.60}
+                for o in others: split[o] = per
+            else:
+                split = {likely: 1.0}
+        else:
+            # even split if our likely isn't chosen
+            per = 1.0 / len(chosen)
+            split = {c: per for c in chosen}
+
+    return {
+        "archetype": archetype,
+        "curve": curve,
+        "weekly_range": (weekly_low, weekly_high),
+        "platform_split": split
+    }
+
+def section1_html(p: AnalyzePayload) -> Tuple[str, Dict]:
+    header = "<div style='font-weight:700;margin:2px 0 8px'>1) Return on Ad Spend</div>"
+    intro = ("We’ll use realistic CPC and conversion assumptions for your business & platforms, then calculate CAC (cost to win 1 customer) and ROAS. "
+             "These are starting-point estimates; refine with your real data.")
+    rows_html, meta = compute_platform_rows(p)
+    html = header + f"<div style='opacity:.9;line-height:1.6'>{intro}</div><div style='margin-top:10px;line-height:1.6'>{rows_html}</div>"
+    return html, meta
+
+def _to_html(text: str) -> str:
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\n", "<br/>"))
+
+def build_prompt_for_sections_2_to_5(p: AnalyzePayload, meta: Dict, plan: Dict) -> str:
+    # pack numbers for the model (read-only)
+    price = meta.get("price_used", {})
+    sale_price = price.get("sale_price")
+    upfront = price.get("upfront")
+    monthly = price.get("monthly")
+
+    nums_lines = []
+    for pl in meta["platforms"]:
+        sp = f"{pl['name'].title()}: CPC ${pl['cpc']:.2f}, conv {pl['conv']*100:.1f}%, CAC {_fmt_money(pl['cac'])}"
+        if pl["roas"] is not None:
+            sp += f", ROAS {pl['roas']:.2f}x"
+        if pl["ltv_roas"] is not None:
+            sp += f", LTV-ROAS {pl['ltv_roas']:.2f}x"
+        nums_lines.append(sp)
+
+    curve_pct = [f"{int(x*100)}%" for x in plan["curve"]]
+    split_lines = [f"{k.title()} {int(v*100)}%" for k, v in plan["platform_split"].items()]
+    wl, wh = plan["weekly_range"]
 
     return f"""
-You are a friendly senior growth strategist for total beginners. Be concise, concrete, and avoid jargon. Short paragraphs, 3–5 bullets max. No tables.
+You are a friendly senior growth strategist for beginners. DO NOT change or invent numbers. Use the numbers and guardrails provided.
 
-CONTEXT
+BUSINESS CONTEXT
 - Name: {p.name}
-- Email: {p.email}
 - URL: {p.business_url or "N/A"}
 - Location: {p.business_location or "N/A"}
-- Advertising type: {p.offer or "N/A"}
+- Offer: {p.offer or "N/A"}
 - Description: {p.business_description or "N/A"}
-- Price text: {p.item_price or "N/A"}
-- Recurring price: {p.recurring_price or "N/A"}
-- Weekly ad spend: {p.current_ad_spend or "N/A"}
+- Price used: {"setup " + str(int(upfront)) if upfront else ""} {"| monthly " + str(int(monthly)) if monthly else ""} {"| sale " + str(int(sale_price)) if sale_price else ""}
 - Platforms: {p.ad_platforms or "N/A"}
 - Biggest struggle: {p.struggle or "N/A"}
 
-BEGIN OUTPUT
-# Opening (two short paragraphs max)
-{opening}
+LOCKED NUMBERS (read-only)
+{chr(10).join("- " + x for x in nums_lines)}
+Weekly budget guide (total): { _fmt_money(wl) }–{ _fmt_money(wh) }
+Spend curve by week: {", ".join(curve_pct)} (Week1→Week4)
+Platform split (starting): {", ".join(split_lines)}
 
-# Target audience (3–5 items only)
-List a few precise targets tailored to their business and location (demographics, interests, job titles, or search keywords).
-End this section with exactly:
-"If interested, Nykra’s AI Ad Optimiser will automate your targeting so it gets sharper with every click, lowering costs over time."
+ARCHETYPE
+- {plan["archetype"]}
 
-# Budget & duration (simple)
-- Give weekly and monthly ranges.
-- Choose always-on baseline vs 1–2 week bursts (high-ticket/limited spots → bursts; services/subscriptions → always-on).
-- Anchor to any weekly spend they gave.
+OUTPUT — EXACT SECTIONS (do not add extra sections):
+2) Target audience
+- 1 short paragraph tailored to the business and location.
+- Then exactly 5 bullets including a mix of: demographics, psychographics, interests, job titles, or high-intent search keywords.
 
-# 4-week plan (beginner-proof)
-{recurring_note}
-- **Week 1–2 – Test:** daily budget, 2–3 creative ideas, one landing-page fix, success targets with numbers (e.g., "Goal: CAC ≤ $X; ROAS ≥ Y").
-- **Week 3–4 – Decide:**
-  - If hitting targets → scale 20–50% on winners.
-  - If close → keep spend flat, fix the bottleneck (ad, page, or offer), retest 1 week.
-  - If missing badly → pause losers, keep the best, try one new angle + one new audience.
+3) 4-week plan
+- Write a clear plan that follows the spend curve and platform split above.
+- Use the weekly budget guide for scale (include a sentence with the range).
+- Translate the archetype into tactics:
+  - finite → urgency, countdowns, raise retargeting in last 5 days, watch seat fill pace
+  - high_durable → longer cycle, heavy nurture, measure CPL/qualified calls, expect closes 6–8 weeks
+  - service_recurring → week1 low test, weeks2–3 scale, week4 taper as calendar fills; tie CAC to LTV
+  - ecom_low → consistent always-on, ROAS guardrails, bundles/AOV lift
+  - generic_mid → simple steady plan with optimization
+- Include numeric success targets (use existing CAC/ROAS numbers sensibly; do NOT alter them).
 
-# Notes by situation
-- **High-ticket services (setups, websites, SEO):** fewer, bigger tests; strong proof (case studies, guarantee). Buyers need multiple touches.
-- **Services with repeat revenue (maintenance/retainer/subscription):** explain LTV briefly; okay to tolerate higher CAC early because monthly revenue compounds value.
-- **Low-ticket product:** emphasize bundles/AOV, capture emails, retargeting.
+4) Address your struggle
+- 1 empathetic paragraph. Give 2 practical fixes tied to the struggle.
+- End exactly with: "Nykra can optimise your ads by automating the target audience every time an ad gets a click — saving money, cutting conversion costs, and getting you more sales."
 
-# Address their struggle (1 short paragraph)
-Acknowledge their specific struggle and give 2 concrete tips matched to their type and location.
-
-# Close (exactly this sentence)
-We can set up the ad structure and connect Nykra’s AI Ad Optimiser so your cost per result keeps dropping.
+5) Summary & notes by situation
+- 3–5 bullets maximum, tailored to their type (finite, high-ticket durable, recurring service, low-ticket ecom).
 """
-
-def _as_html(text: str) -> str:
-    safe = (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>"))
-    return f'<div class="nykra-calc-result" style="line-height:1.55;color:#e8eaed">{safe}</div>'
 
 @app.post("/analyze")
 def analyze(payload: AnalyzePayload):
     try:
+        # Opening line
+        opening = "<div style='font-weight:700;margin:2px 0 8px'>Thanks for using the Nykra CPA calculator. Here are your results.</div>"
+
+        # Section 1 (deterministic)
+        s1_html, meta = section1_html(payload)
+
+        # Archetype + budgets
+        plan = choose_archetype(payload, meta)
+
+        # Model-written Sections 2–5 (no math; strict format)
+        prompt = build_prompt_for_sections_2_to_5(payload, meta, plan)
         completion = client.chat.completions.create(
             model=MODEL,
             messages=[
-                {"role": "system", "content": "You are Nykra Studio's helpful growth strategist. Be clear, concrete, and beginner-first. Use numbers and small steps. Never invent prices."},
-                {"role": "user", "content": _build_prompt(payload)},
-            ]
+                {"role": "system", "content": "You are Nykra Studio's helpful growth strategist. Be clear, concrete, and beginner-first. Never change provided numbers."},
+                {"role": "user", "content": prompt},
+            ],
         )
-        text = completion.choices[0].message.content.strip()
-        return {"result_html": _as_html(text), "plain_text": text}
+        s2to5 = completion.choices[0].message.content.strip()
+
+        # Assemble response
+        html = (
+            f"<div class='nykra-calc-result' style='line-height:1.55;color:#e8eaed'>"
+            f"{opening}"
+            f"{s1_html}"
+            f"<div style='font-weight:700;margin:14px 0 8px'>2–5) Plan & Guidance</div>"
+            f"{_to_html(s2to5)}"
+            f"</div>"
+        )
+        return {"result_html": html, "plain_text": f"Thanks for using the Nykra CPA calculator. Here are your results.\n\n[s1]\n{re.sub('<[^<]+?>','',s1_html)}\n\n[s2-5]\n{s2to5}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model error: {e}")
