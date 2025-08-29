@@ -110,8 +110,7 @@ def analyze(payload: AnalyzePayload):
             messages=[
                 {"role": "system", "content": "You are Nykra Studio's helpful growth strategist. Be clear, actionable, kind."},
                 {"role": "user", "content": _build_prompt(payload)},
-            ],
-            temperature=0.35,
+            ]
         )
         text = completion.choices[0].message.content.strip()
         return {"result_html": _as_html(text), "plain_text": text}
