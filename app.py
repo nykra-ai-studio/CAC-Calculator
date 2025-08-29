@@ -1,7 +1,7 @@
-# app.py — Nykra CAC/Ad Spend backend (Beginner-First, Hardwired Opening)
+# app.py — Nykra CAC/Ad Spend backend (Beginner-first, hardwired opening)
 
-import os, re
-from typing import Optional
+import os, re, statistics
+from typing import Optional, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -26,94 +26,146 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Payload (matches your front-end names; location added) ----
+# ---- Payload (matches your front-end) ----
 class AnalyzePayload(BaseModel):
     name: str
     email: EmailStr
     business_url: Optional[str] = None
-    business_location: Optional[str] = None     # NEW (ok if None)
+    business_location: Optional[str] = None
     business_description: Optional[str] = None
-    offer: Optional[str] = None                 # "Product, Service, ..." (joined)
-    offer_details: Optional[str] = None         # unused by current UI; kept for compat
-    item_price: Optional[str] = None            # "$10,000"
-    expected_profit: Optional[str] = None       # kept for compat
-    recurring: Optional[str] = None             # kept for compat
-    current_ad_spend: Optional[str] = None      # weekly "$500"
+    offer: Optional[str] = None                 # "Product, Service, Experience, Subscription"
+    offer_details: Optional[str] = None         # kept for compatibility
+    item_price: Optional[str] = None            # now free-text (price or description)
+    expected_profit: Optional[str] = None
+    recurring: Optional[str] = None
+    current_ad_spend: Optional[str] = None      # weekly (free-text)
     ad_platforms: Optional[str] = None
     struggle: Optional[str] = None
 
-def _to_number(s: Optional[str]) -> Optional[float]:
-    if not s:
+# ---- Small helpers ----
+def _money_numbers(text: Optional[str]) -> List[float]:
+    """Extracts numeric $ amounts from messy text/ranges like `$100–$300` or `1,200`."""
+    if not text:
+        return []
+    # capture numbers with optional thousands and decimals
+    nums = re.findall(r'(?<![A-Za-z])(?:\$?\s*)(\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)(?!%)', text)
+    out = []
+    for n in nums:
+        try:
+            out.append(float(n.replace(",", "").replace(" ", "")))
+        except:
+            pass
+    return out
+
+def _representative_price(text: Optional[str]) -> Optional[float]:
+    """Choose a single representative price from list (median of found numbers)."""
+    vals = _money_numbers(text)
+    if not vals:
         return None
-    cleaned = re.sub(r"[^\d.]", "", s)
     try:
-        return float(cleaned) if cleaned else None
-    except:
-        return None
+        return float(statistics.median(vals))
+    except statistics.StatisticsError:
+        return float(vals[0])
+
+def _fmt_money(x: float) -> str:
+    return f"${x:,.0f}"
+
+def _guess_cpc(offer: Optional[str], platforms: Optional[str], desc: Optional[str]) -> float:
+    """Very simple CPC guesser. Services/search → ~3.0; else social/awareness → ~1.5."""
+    s = " ".join([offer or "", platforms or "", desc or ""]).lower()
+    # high-intent/service signals → Google-ish CPC
+    service_signals = ["service", "google", "search", "plumb", "electric", "therap", "dent", "law", "consult", "solar", "repair", "roof"]
+    if any(k in s for k in service_signals):
+        return 3.0
+    # otherwise lean social
+    return 1.5
+
+def _to_float(text: Optional[str]) -> Optional[float]:
+    nums = _money_numbers(text)
+    return nums[0] if nums else None
+
+def _build_opening(payload: AnalyzePayload) -> str:
+    """Hardwired beginner opening with CAC & ROAS using 1% CR + CPC guess."""
+    cpc = _guess_cpc(payload.offer, payload.ad_platforms, payload.business_description)
+    conv = 0.01  # 1% default
+    clicks_needed = int(round(1 / conv))  # 100 clicks
+    cac = cpc / conv  # CPC / 1% = CPC * 100
+
+    price_val = _representative_price(payload.item_price)
+    roas_line = ""
+    verdict_line = ""
+    if price_val:
+        roas = price_val / cac if cac > 0 else 0
+        margin = price_val - cac
+        sign = "profit" if margin >= 0 else "loss"
+        roas_line = f"At an average sale of {_fmt_money(price_val)}, ROAS ≈ {roas:,.2f}x and profit after ads ≈ {_fmt_money(abs(margin))} {sign} per sale."
+        verdict_line = "→ That means ads are likely worth running." if roas >= 1 else "→ That means ads are not worth it yet. Consider raising price, bundling/upsells, or improving the page before scaling."
+    else:
+        roas_line = "If your average sale is higher than that CAC, ads can work; if it’s lower, improve the offer/AOV or the funnel before scaling."
+        verdict_line = ""
+
+    loc = payload.business_location or "your region"
+    return (
+        "Simple check — CAC & ROAS\n"
+        f"This plan helps you decide ad spend and whether ads are worth it. "
+        f"CAC (customer acquisition cost) is what you spend to win 1 customer. "
+        f"We’ll assume a 1% conversion rate (about {clicks_needed} clicks per sale) and a sensible click cost for {loc}. "
+        f"With an estimated CPC of {_fmt_money(cpc)}, you’d need ~{clicks_needed} clicks, costing about {_fmt_money(cac)} for one sale.\n"
+        "ROAS (return on ad spend) is revenue ÷ ad spend.\n"
+        f"{roas_line} {verdict_line}"
+    )
 
 def _build_prompt(p: AnalyzePayload) -> str:
-    price = _to_number(p.item_price)
-    spend_week = _to_number(p.current_ad_spend)
+    # Build the deterministic opening
+    opening = _build_opening(p)
 
     return f"""
-You are a friendly senior growth strategist for beginners. Output must be crystal clear and short-paragraph/bulleted.
+You are a friendly senior growth strategist for total beginners. Keep it concise, plain-English, and confidence-building.
+Use short paragraphs and short bulleted lists (3–5 bullets). No tables. Always include concrete numbers.
 
-USER INPUT
+CONTEXT FROM USER
 - Name: {p.name}
 - Email: {p.email}
 - Business URL: {p.business_url or "N/A"}
 - Location: {p.business_location or "N/A"}
-- What they are advertising (type): {p.offer or "N/A"}
-- Business description: {p.business_description or "N/A"}
-- Average sale value: {price if price is not None else "N/A"}
-- Current WEEKLY ad spend: {spend_week if spend_week is not None else "N/A"}
-- Platforms (user plan): {p.ad_platforms or "N/A"}
+- What they’re advertising: {p.offer or "N/A"}
+- Description: {p.business_description or "N/A"}
+- Average sale value (free-text): {p.item_price or "N/A"}
+- Current WEEKLY ad spend: {p.current_ad_spend or "N/A"}
+- Planned platforms: {p.ad_platforms or "N/A"}
 - Biggest struggle: {p.struggle or "N/A"}
 
-ABSOLUTE TONE RULES
-- Speak to a total beginner. No jargon. If a term appears, define it simply in the same line.
-- Keep lists short. Do not overwhelm.
-- Use sensible default assumptions when data is missing, and say the assumption plainly.
+BEGIN OUTPUT NOW
+# Opening (keep EXACTLY two short paragraphs)
+{opening}
 
-HARDWIRED OPENING (must be the very first section; keep it tight and numbers-filled):
-1) One paragraph: “This plan helps you decide ad spend and if ads are worth it.”
-   - Define: CAC = how much you spend to win 1 customer (roughly cost-per-click ÷ conversion-rate). ROAS = revenue ÷ ad spend (how many dollars you get back per $1).
-   - Pick ONE {p.business_location or "generic"}-sensible CPC assumption **in $** based on the channel most likely for their business:
-       * If they mention Google or high-intent search/service: CPC ~ $1.5–$6 → choose a single number (e.g., $3).
-       * If Meta/Instagram/ecom/awareness: CPC ~ $0.8–$3 → choose a single number (e.g., $1.50).
-       * If nothing given, choose a conservative middle (e.g., $2.00) and say it's a guess we’ll refine.
-   - Use a default 1% conversion rate if unknown.
-   - Compute example CAC = CPC / 1% (e.g., $2.00 / 0.01 = $200 per customer).
-   - If average sale value is provided, compute example ROAS on one sale at that CAC (ROAS = price ÷ CAC). Say “worth it” if ROAS > 1; else “not worth it yet” and state why.
-   - If price missing, assume a modest price for their category and show the same math, clearly labeled “assumption”.
+# Target audience (3–5 items only)
+List a few **precise** targets tailored to their business and location (demographics, interests, job titles, or search keywords). 
+End this section with this exact sentence:
+"If interested, Nykra’s AI Ad Optimiser will automate your targeting so it gets sharper with every click, lowering costs over time."
 
-TARGET AUDIENCE (very short)
-- Give 3–5 precise targets only (demographics, interests, job titles or keywords) tailored to the business and {p.business_location or "their region"}.
-- End this section with: “If interested, Nykra’s AI Ad Optimiser auto-tunes your targeting after every click to lower your costs over time.”
-
-BUDGET & DURATION (simple)
+# Budget & duration (very simple)
 - Give a weekly and monthly spend range.
-- Recommend “always-on baseline” vs “short burst” depending on offer type (high-ticket/limited spots → bursts; services/subscriptions → always-on).
-- If they entered a current weekly spend, anchor advice to it.
+- Recommend "always-on baseline" vs "1–2 week bursts" (high-ticket/limited spots → bursts; services/subscriptions → always-on).
+- If they gave a current weekly spend, anchor your suggestion to it.
 
-PLAN (4 weeks, beginner-proof)
-- Week 1–2 (Test): exact daily budget, 2–3 creative ideas, 1 landing-page tweak, simple success targets: CAC goal and ROAS goal.
-- Week 3–4 (Decide): 
-   * If CAC ≤ target and ROAS ≥ target → scale budget by 20–50% on winners.
-   * If close to targets → keep spend flat, fix 1–2 bottlenecks (ad, page, offer), retest.
-   * If far from targets → pause losers, keep only the best; try one new angle and one new audience.
-- Spell out targets as numbers (e.g., “Goal: CAC ≤ $X; ROAS ≥ Y”).
+# 4-week plan (beginner-proof)
+- **Week 1–2 – Test:** daily budget, 2–3 creative ideas, 1 landing-page fix, simple success targets with numbers (e.g., "Goal: CAC ≤ $X; ROAS ≥ Y").
+- **Week 3–4 – Decide:** clear branching:
+  - If hitting targets → scale 20–50% on winners, widen audiences/keywords a little.
+  - If close to targets → keep spend flat, fix the bottleneck (ad, page, or offer), retest.
+  - If missing badly → pause losers, keep the best one, try one new angle + one new audience.
 
-INDUSTRY-SPECIFIC NOTES
-- If high-ticket (e.g., ${price if price else ">$1,000"}): fewer weeks, higher daily budget, stronger proof (case studies, testimonials, guarantees), and explain that big-ticket buyers need more touches.
-- If service with repeat customers: explain lifetime value (LTV) in one line; ok to tolerate higher CAC initially.
-- If product low-ticket: emphasize bundles, AOV boosts, email capture, retargeting.
+# Notes by situation
+- **High-ticket (>$1k):** fewer weeks, higher daily budget, strong proof (testimonials/case studies), explain that buyers need more touches.
+- **Services with repeat customers:** explain LTV in one line; okay to tolerate higher CAC initially because repeats cover it later.
+- **Low-ticket product:** emphasize bundles, AOV boosts, email capture + retargeting.
 
-RESPOND TO THEIR STRUGGLE (one short paragraph)
-- Acknowledge the struggle they wrote, give 2 concrete tips tailored to their type and {p.business_location or "region"} (e.g., “ads didn’t work before → go bigger for a short burst or focus on high-intent search first; tiny budgets + broad awareness = wasted spend”).
+# Address their struggle (1 short paragraph)
+Acknowledge their specific struggle and give 2 practical tips that match their business type and location.
 
-CLOSE (soft)
-- 1–2 sentences: offer help to set up the initial structure and connect Nykra’s AI Ad Optimiser to keep improving targeting and cost per result.
+# Soft close (1 sentence)
+Offer help to set up the structure and connect Nykra’s AI Ad Optimiser so the cost per result keeps dropping.
 """
 
 def _as_html(text: str) -> str:
@@ -139,4 +191,3 @@ def analyze(payload: AnalyzePayload):
         return {"result_html": _as_html(text), "plain_text": text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model error: {e}")
-
