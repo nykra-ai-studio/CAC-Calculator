@@ -18,7 +18,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 LTV_MONTHS = int(os.getenv("LTV_MONTHS", "6"))         # change to 12 if you prefer
-N8N_WEBHOOK_URL = "https://nykrastudio.app.n8n.cloud/webhook/nykra-cac-intake"  # Hardcoded URL as requested
+
+# Define both webhook URLs
+N8N_WEBHOOK_TEST_URL = "https://nykrastudio.app.n8n.cloud/webhook-test/nykra-cac-intake"
+N8N_WEBHOOK_PROD_URL = "https://nykrastudio.app.n8n.cloud/webhook/nykra-cac-intake"
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -90,10 +93,17 @@ def _parse_price_details(item_price_text: Optional[str], recurring_text: Optiona
     Priority:
       - upfront: numbers labelled near setup/upfront/project/website/refresh/initial; fallback largest >= 200
       - monthly: explicit recurring_price if given; else labelled near month/mo/maintenance/retainer/subscription; fallback 30..1500 not equal to upfront
-      - avg_sale: upfront if present else median of all numbers
+      - avg_sale: directly use the first number from item_price_text
     """
     upfront_keys = ["setup", "upfront", "project", "website", "refresh", "initial", "one-off", "once"]
     monthly_keys = ["per month", "month", "mo", "monthly", "maintenance", "retainer", "subscription"]
+
+    # First, extract the main sale value directly from item_price_text
+    avg_sale = None
+    if item_price_text:
+        nums = _nums_in(item_price_text)
+        if nums:
+            avg_sale = nums[0][0]  # Use the first number found
 
     s = item_price_text or ""
     pairs = _nums_in(s)
@@ -128,14 +138,8 @@ def _parse_price_details(item_price_text: Optional[str], recurring_text: Optiona
     else:
         monthly = None
 
-    # Use the first number from item_price_text as avg_sale if available
-    if pairs:
-        avg_sale = pairs[0][0]
-    else:
-        avg_sale = None
-
-    # If upfront is present, use it as avg_sale only if avg_sale is not already set
-    if upfront is not None and avg_sale is None:
+    # If avg_sale is still None, fall back to upfront
+    if avg_sale is None and upfront is not None:
         avg_sale = upfront
 
     return {"upfront": upfront, "monthly": monthly, "avg_sale": avg_sale}
@@ -234,7 +238,12 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
     upfront = price_info["upfront"]
     monthly = price_info["monthly"]
     avg_sale = price_info["avg_sale"]
-    sale_price = upfront or avg_sale
+    
+    # Ensure we're using the correct sale price
+    sale_price = avg_sale  # Prioritize the directly extracted value
+    if sale_price is None:
+        sale_price = upfront  # Fall back to upfront if needed
+        
     has_recurring = monthly is not None
 
     plats = _platforms_list(p.ad_platforms)
@@ -247,8 +256,6 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
 
     rows = []
     meta = {"platforms": []}
-    
-    # Don't use location for industry assumptions
     industry_type = "your industry"
 
     for plat in plats:
@@ -441,15 +448,22 @@ OUTPUT — EXACT SECTIONS (do not add extra sections):
 
 # ---------- n8n lead sender (BackgroundTask) ----------
 async def send_lead_to_n8n_async(data: dict):
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as ac:
-            r = await ac.post(N8N_WEBHOOK_URL, json=data, headers={"Content-Type": "application/json"})
-            if r.status_code >= 400:
-                # one quick retry
-                await ac.post(N8N_WEBHOOK_URL, json=data, headers={"Content-Type": "application/json"})
-    except Exception:
-        # silent fail — never break the calculator if n8n is down
-        pass
+    urls_to_try = [N8N_WEBHOOK_TEST_URL, N8N_WEBHOOK_PROD_URL]
+    success = False
+    
+    for url in urls_to_try:
+        if success:
+            break
+            
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as ac:
+                r = await ac.post(url, json=data, headers={"Content-Type": "application/json"})
+                if r.status_code < 400:
+                    success = True
+                    break
+        except Exception:
+            # Continue to next URL if this one fails
+            pass
 
 # ---------- Endpoint ----------
 @app.post("/analyze")
