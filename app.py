@@ -6,6 +6,7 @@ import openai
 import os
 from datetime import datetime
 import re
+import json
 
 app = FastAPI(title="Nykra CAC Calculator API")
 
@@ -51,8 +52,82 @@ def extract_price_from_string(price_str: str) -> float:
             return float(numbers[0])
     return 1000  # default
 
+async def get_gpt_assumptions(platform: str, industry: str, price: float, recurring: bool) -> dict:
+    """Use GPT to get more accurate CPC and conversion rate assumptions"""
+    try:
+        # Fallback values in case API call fails
+        fallback = {
+            'cpc': 1.50 if platform.lower() in ['meta', 'facebook'] else 2.50,
+            'conversion_rate': 0.02
+        }
+        
+        # Create a detailed prompt for GPT
+        prompt = f"""As a digital marketing expert, provide realistic CPC and conversion rate estimates for the following scenario:
+
+Platform: {platform}
+Industry: {industry}
+Product/Service Price: ${price}
+Recurring Revenue: {"Yes" if recurring else "No"}
+
+Please respond in JSON format only with these two values:
+{{"cpc": 0.00, "conversion_rate": 0.00}}
+
+Where:
+- cpc is the average cost per click in USD (typical range $0.50-$10.00)
+- conversion_rate is the decimal probability of conversion (typical range 0.001-0.05)
+
+Consider that:
+- Higher-priced items typically have lower conversion rates
+- B2B generally has higher CPC than B2C
+- Competitive industries like finance have higher CPCs
+- Recurring services may have different metrics than one-time purchases
+"""
+
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a digital marketing analytics expert who provides precise numerical estimates."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=150
+        )
+        
+        # Extract JSON from response
+        content = response.choices[0].message.content.strip()
+        # Find JSON in the response (in case GPT adds explanatory text)
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0)
+            
+        result = json.loads(content)
+        
+        # Validate the results are within reasonable ranges
+        cpc = float(result.get('cpc', fallback['cpc']))
+        conversion_rate = float(result.get('conversion_rate', fallback['conversion_rate']))
+        
+        # Apply sanity checks
+        if cpc < 0.1 or cpc > 50:
+            cpc = fallback['cpc']
+        if conversion_rate < 0.0001 or conversion_rate > 0.2:
+            conversion_rate = fallback['conversion_rate']
+            
+        # Apply price-based conversion rate adjustment if GPT didn't account for it
+        if price > 5000 and conversion_rate > 0.01:
+            conversion_rate = min(conversion_rate, 0.01)
+        
+        return {
+            'cpc': cpc,
+            'conversion_rate': conversion_rate
+        }
+        
+    except Exception as e:
+        print(f"GPT API error: {str(e)}")
+        # Fallback to the original method if GPT fails
+        return get_platform_assumptions(platform, industry)
+
 def get_platform_assumptions(platform: str, industry: str) -> dict:
-    """Get CPC and conversion rate assumptions based on platform and industry"""
+    """Get CPC and conversion rate assumptions based on platform and industry (fallback method)"""
     platform = platform.lower().strip()
     
     # Base assumptions - these would ideally come from a database
@@ -86,7 +161,7 @@ def get_platform_assumptions(platform: str, industry: str) -> dict:
     
     return assumptions
 
-def calculate_roas_analysis(platforms: str, price: float, industry: str, recurring: bool) -> str:
+async def calculate_roas_analysis(platforms: str, price: float, industry: str, recurring: bool) -> str:
     """Calculate ROAS analysis for given platforms"""
     if not platforms:
         platforms = "Meta"
@@ -95,7 +170,8 @@ def calculate_roas_analysis(platforms: str, price: float, industry: str, recurri
     analysis = ""
     
     for platform in platform_list:
-        assumptions = get_platform_assumptions(platform, industry)
+        # Use GPT for more accurate assumptions
+        assumptions = await get_gpt_assumptions(platform, industry, price, recurring)
         cpc = assumptions['cpc']
         conv_rate = assumptions['conversion_rate']
         
@@ -242,7 +318,7 @@ async def analyze_calculator(request: CalculatorRequest):
         result_text += "1. Return on Ad Spend\n"
         result_text += "We'll use realistic CPC and conversion assumptions for your business & platforms, then calculate CAC (cost to win 1 customer) and ROAS. These are starting-point estimates; refine with your real data.\n\n"
         
-        roas_analysis = calculate_roas_analysis(
+        roas_analysis = await calculate_roas_analysis(
             request.ad_platforms or "Meta", 
             price, 
             request.business_description or "", 
@@ -306,4 +382,3 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
