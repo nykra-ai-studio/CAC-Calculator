@@ -84,6 +84,10 @@ def detect_industry(business_description: str) -> str:
     if any(term in business_description for term in ["real estate", "property", "home", "house", "apartment", "realtor"]):
         return "real_estate"
     
+    # Retreat/Experience detection
+    if any(term in business_description for term in ["retreat", "experience", "wellness", "event", "workshop", "seminar"]):
+        return "experience"
+    
     # Local service detection
     if any(term in business_description for term in ["service", "local business", "contractor", "plumber", "electrician", "cleaning"]):
         return "local_service"
@@ -156,6 +160,23 @@ but benefit from recurring revenue and longer customer lifetimes.
 E-commerce typically has lower conversion rates for cold traffic but benefits from 
 retargeting and repeat purchases. Consider average order value and purchase frequency.
 """
+        elif detected_industry == "experience":
+            prompt += """
+Retreat and experience businesses typically have higher CPCs ($2-4) and lower conversion rates (0.5-1.5%)
+due to the high-consideration nature of these purchases and longer decision cycles.
+"""
+
+        # Add price-based context
+        if price >= 5000:
+            prompt += f"""
+High-ticket items (${price}) typically have much lower conversion rates (often 0.1-0.5%) 
+and higher CPCs due to targeting more affluent customers and longer decision cycles.
+"""
+        elif price >= 2000:
+            prompt += f"""
+Mid-to-high ticket items (${price}) typically have lower conversion rates (often 0.5-1.5%)
+compared to lower-priced offerings.
+"""
 
         prompt += """
 Please respond in JSON format only with these values:
@@ -212,11 +233,11 @@ Where:
         if detected_industry == "healthcare" and recurring and ltv_multiplier < 5:
             ltv_multiplier = 8  # Average therapy client attends ~8 sessions
             
-        # Apply price-based conversion rate adjustment
-        if price > 5000 and conversion_rate > 0.01:
-            conversion_rate = min(conversion_rate, 0.01)
-        elif price > 1000 and conversion_rate > 0.02:
-            conversion_rate = min(conversion_rate, 0.02)
+        # Apply stronger price-based conversion rate adjustment
+        if price > 5000:
+            conversion_rate = min(conversion_rate, 0.005)  # Max 0.5% for high-ticket
+        elif price > 2000:
+            conversion_rate = min(conversion_rate, 0.01)   # Max 1% for mid-high ticket
         
         print(f"GPT estimates for {platform} in {detected_industry}: CPC=${cpc}, Conv={conversion_rate}, LTV={ltv_multiplier}")
         
@@ -230,15 +251,30 @@ Where:
         print(f"GPT API error: {str(e)}")
         # Use industry-specific fallbacks instead of generic ones
         industry = detect_industry(business_description)
-        if industry == "healthcare":
-            return {'cpc': 3.5, 'conversion_rate': 0.01, 'ltv_multiplier': 8 if recurring else 1}
-        elif industry == "saas":
-            return {'cpc': 4.0, 'conversion_rate': 0.015, 'ltv_multiplier': 12 if recurring else 1}
-        elif industry == "finance":
-            return {'cpc': 5.0, 'conversion_rate': 0.01, 'ltv_multiplier': 3 if recurring else 1}
+        
+        # Apply price-based adjustments to fallback values
+        if price > 5000:
+            conv_multiplier = 0.25  # 75% reduction for high-ticket
+        elif price > 2000:
+            conv_multiplier = 0.5   # 50% reduction for mid-high ticket
         else:
-            # Generic fallback with platform differences
-            return get_platform_assumptions(platform, industry)
+            conv_multiplier = 1.0
+            
+        if industry == "healthcare":
+            return {'cpc': 3.5, 'conversion_rate': 0.01 * conv_multiplier, 'ltv_multiplier': 8 if recurring else 1}
+        elif industry == "saas":
+            return {'cpc': 4.0, 'conversion_rate': 0.015 * conv_multiplier, 'ltv_multiplier': 12 if recurring else 1}
+        elif industry == "finance":
+            return {'cpc': 5.0, 'conversion_rate': 0.01 * conv_multiplier, 'ltv_multiplier': 3 if recurring else 1}
+        elif industry == "experience":
+            return {'cpc': 3.0, 'conversion_rate': 0.01 * conv_multiplier, 'ltv_multiplier': 1}
+        else:
+            # Generic fallback with platform and price differences
+            base_conv = 0.02 * conv_multiplier
+            if platform.lower() in ['google', 'search']:
+                return {'cpc': 2.5, 'conversion_rate': 0.035 * conv_multiplier, 'ltv_multiplier': 1}
+            else:
+                return {'cpc': 1.5, 'conversion_rate': base_conv, 'ltv_multiplier': 1}
 
 def get_platform_assumptions(platform: str, industry: str) -> dict:
     """Get CPC and conversion rate assumptions based on platform and industry (fallback method)"""
@@ -264,6 +300,7 @@ def get_platform_assumptions(platform: str, industry: str) -> dict:
         'finance': {'cpc': 3.0, 'conversion': 0.5, 'ltv': 3},
         'education': {'cpc': 2.0, 'conversion': 0.7, 'ltv': 1},
         'real_estate': {'cpc': 2.5, 'conversion': 0.5, 'ltv': 1},
+        'experience': {'cpc': 2.0, 'conversion': 0.6, 'ltv': 1},
         'local_service': {'cpc': 1.5, 'conversion': 0.8, 'ltv': 2}
     }
     
@@ -367,6 +404,12 @@ def generate_target_audience(business_name: str, business_description: str, pric
         interests = "Professional development, certifications, learning platforms"
         keywords = "learn [skill], certification in [field], courses for [profession]"
         job_titles = "Professionals seeking advancement, HR managers, Training coordinators"
+    elif industry == "experience":
+        demo = "Adults aged 30-65 seeking transformative experiences"
+        psycho = "Wellness-focused, experience-seekers, personal growth oriented"
+        interests = "Wellness, personal development, transformative experiences, travel"
+        keywords = "wellness retreat, transformative experience, [specific type] retreat"
+        job_titles = "Professionals seeking work-life balance, HR directors, Wellness coordinators"
     else:
         # Generate audience based on price point and business type
         if price >= 5000:  # High ticket
@@ -407,6 +450,7 @@ def generate_4_week_plan(platforms: str, price: float, recurring: bool, business
     is_high_ticket = price >= 3000
     is_service = "service" in business_description.lower() or industry in ["healthcare", "local_service"]
     is_ecom = industry == "ecommerce"
+    is_experience = industry == "experience"
     
     # Base weekly budget (adjust based on price point)
     if price >= 5000:
@@ -423,6 +467,9 @@ def generate_4_week_plan(platforms: str, price: float, recurring: bool, business
     elif industry == "saas":
         # SaaS typically has longer sales cycles
         base_budget = max(base_budget, 200)  # Minimum $200/week for SaaS
+    elif industry == "experience":
+        # Experiences often need higher budgets for awareness
+        base_budget = max(base_budget, 200)  # Minimum $200/week for experiences
     
     plan = "**4-Week Advertising Plan:**\n\n"
     
@@ -432,6 +479,11 @@ def generate_4_week_plan(platforms: str, price: float, recurring: bool, business
         plan += f"**Week 2 (Refine):** ${base_budget * 1.5} - Optimize targeting and messaging\n"
         plan += f"**Week 3 (Scale):** ${base_budget * 2} - Scale successful campaigns\n"
         plan += f"**Week 4 (Sustain):** ${base_budget * 1.5} - Maintain consistent presence\n"
+    elif is_experience:
+        # Experience/retreat strategy - often seasonal or event-based
+        plan += f"**Week 1 (Awareness):** ${base_budget} - Build awareness with broad targeting\n"
+        plan += f"**Week 2 (Consideration):** ${base_budget * 1.5} - Target interested audiences with detailed content\n"
+        plan += f"**Week 3-4 (Conversion):** ${base_budget * 2} each week - Focus on conversion with urgency and social proof\n"
     elif recurring and not is_high_ticket:
         # Recurring service strategy
         plan += f"**Week 1 (Test):** ${base_budget} - Test audiences and ad creatives\n"
@@ -464,6 +516,8 @@ def generate_4_week_plan(platforms: str, price: float, recurring: bool, business
         plan += "\n\n**Healthcare Note:** Ensure all ads comply with healthcare advertising policies. Focus on building trust and highlighting credentials."
     elif industry == "saas":
         plan += "\n\n**SaaS Note:** Consider longer sales cycles. Allocate budget for retargeting campaigns to nurture leads."
+    elif industry == "experience":
+        plan += "\n\n**Experience Note:** Focus on visual storytelling and testimonials. Consider seasonal timing and booking windows in your campaign planning."
     
     return plan
 
@@ -499,6 +553,9 @@ def address_struggle(struggle: str, business_description: str, price: float) -> 
     elif industry == "saas":
         response += "For SaaS businesses, consider offering free trials or demos to reduce friction. "
         response += "Focus on specific pain points your software solves rather than feature lists. "
+    elif industry == "experience":
+        response += "For experience-based businesses, focus on emotional storytelling and transformative outcomes. "
+        response += "Visual content and past participant testimonials are particularly powerful. "
     
     response += "Remember, every successful business started with testing and optimization. "
     response += "Follow the 4-week plan above, track your metrics, and adjust based on real performance data. "
@@ -545,7 +602,7 @@ async def analyze_calculator(request: CalculatorRequest):
             price, 
             request.recurring, 
             request.business_description or ""
-        )
+        )  # Fixed missing parenthesis here
         result_text += week_plan + "\n\n"
         
         # 4. Address struggle
@@ -564,9 +621,19 @@ async def analyze_calculator(request: CalculatorRequest):
             
             # For recurring services, base CAC target on LTV
             industry = detect_industry(request.business_description or "")
-            ltv_multiplier = 8 if industry == "healthcare" else 6  # Default multipliers
+            
+            # Get appropriate LTV multiplier based on industry
+            if industry == "healthcare":
+                ltv_multiplier = 8  # Average therapy client attends ~8 sessions
+            elif industry == "saas":
+                ltv_multiplier = 12  # SaaS typically has longer retention
+            else:
+                ltv_multiplier = 6  # Default for recurring services
+                
             ltv = price * ltv_multiplier
-            result_text += f"- Expected CAC target: Keep under ${ltv * 0.5:.0f} for healthy LTV-ROAS.\n"
+            
+            # Use more reasonable CAC target for recurring services
+            result_text += f"- Expected CAC target: Keep under ${price * 0.5:.0f} for initial sale, up to ${ltv * 0.3:.0f} considering LTV.\n"
         else:
             # For one-time purchases, base CAC target on initial price
             result_text += f"- Expected CAC target: Keep under ${price * 0.3:.0f} for healthy ROAS.\n"
@@ -585,12 +652,3 @@ async def analyze_calculator(request: CalculatorRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
