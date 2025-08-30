@@ -1,12 +1,15 @@
 # app.py — Nykra CPA/CAC Calculator (deterministic math + archetype plans)
 # - Section 1 (ROAS per platform) computed here (no model math)
 # - GPT writes Sections 2–5 using our numbers & guardrails
+# - Sends lead (name, email, website, source=Calculator) to n8n in a BackgroundTask
 
-import os, re, statistics, math, threading
+import os, re, statistics, math
 from typing import Optional, List, Tuple, Dict
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
+
 from openai import OpenAI
 import httpx
 
@@ -14,8 +17,8 @@ import httpx
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
-LTV_MONTHS = int(os.getenv("LTV_MONTHS", "6"))  # change to 12 if you prefer
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # e.g., https://nykrastudio.app.n8n.cloud/webhook/nykra-cac-intake
+LTV_MONTHS = int(os.getenv("LTV_MONTHS", "6"))         # change to 12 if you prefer
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")         # e.g. https://nykrastudio.app.n8n.cloud/webhook/nykra-cac-intake
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -31,6 +34,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def root():
+    return {"ok": True, "service": "nykra-cac"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 # ---------- Payload ----------
 class AnalyzePayload(BaseModel):
     name: str
@@ -38,14 +49,14 @@ class AnalyzePayload(BaseModel):
     business_url: Optional[str] = None
     business_location: Optional[str] = None
     business_description: Optional[str] = None
-    offer: Optional[str] = None                 # "Product, Service, Experience, Subscription" (comma-joined)
+    offer: Optional[str] = None                  # "Product, Service, Experience, Subscription" (comma-joined)
     offer_details: Optional[str] = None
-    item_price: Optional[str] = None            # free text (may include multiple numbers)
-    recurring_price: Optional[str] = None       # NEW: explicit recurring amount text
+    item_price: Optional[str] = None             # free text (may include multiple numbers)
+    recurring_price: Optional[str] = None        # explicit recurring amount text
     expected_profit: Optional[str] = None
     recurring: Optional[str] = None
     current_ad_spend: Optional[str] = None
-    ad_platforms: Optional[str] = None          # e.g., "Meta, Google, TikTok"
+    ad_platforms: Optional[str] = None           # e.g., "Meta, Google, TikTok"
     struggle: Optional[str] = None
 
 # ---------- helpers ----------
@@ -284,19 +295,13 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
         if best["name"] != worst["name"]:
             rows.append(f"→ Right now <b>{best['name'].title()}</b> looks stronger than {worst['name'].title()} under these assumptions.")
 
-    echo_bits = []
-    if upfront is not None: echo_bits.append(f"setup: {_fmt_money(upfront)}")
-    if monthly is not None: echo_bits.append(f"recurring: {_fmt_money(monthly)}/mo")
-    if not echo_bits and sale_price is not None: echo_bits.append(f"average sale used: {_fmt_money(sale_price)}")
     meta["price_used"] = {"upfront": upfront, "monthly": monthly, "sale_price": sale_price}
-
     lines_html = "<br/>".join(rows)
     return lines_html, meta
 
 def choose_archetype(p: AnalyzePayload, meta: Dict) -> Dict:
     pi = meta.get("price_used", {})
     sale_price = pi.get("sale_price")
-    upfront = pi.get("upfront")
     monthly = pi.get("monthly")
 
     is_srv = _is_service(p.offer, p.business_description)
@@ -320,6 +325,7 @@ def choose_archetype(p: AnalyzePayload, meta: Dict) -> Dict:
         archetype = "generic_mid"
         curve = [0.25, 0.25, 0.25, 0.25]
 
+    # Budget guidance (aim for ~8 CACs total per platform in first month)
     min_per_plat = []
     for pl in meta["platforms"]:
         cac = pl["cac"] or 300.0
@@ -432,29 +438,35 @@ OUTPUT — EXACT SECTIONS (do not add extra sections):
 - 3–5 bullets maximum, tailored to their type (finite, high-ticket durable, recurring service, low-ticket ecom).
 """
 
-# ---------- n8n lead sender (fire-and-forget) ----------
-def _send_lead_to_n8n(payload: AnalyzePayload):
+# ---------- n8n lead sender (BackgroundTask) ----------
+async def send_lead_to_n8n_async(data: dict):
     if not N8N_WEBHOOK_URL:
         return
-    data = {
-        "name": payload.name,
-        "email": payload.email,
-        "business_url": payload.business_url or "",
-        "website": payload.business_url or "",
-        "source": "Calculator"
-    }
     try:
-        with httpx.Client(timeout=2.5) as client_http:
-            client_http.post(N8N_WEBHOOK_URL, json=data)
+        async with httpx.AsyncClient(timeout=8.0) as ac:
+            r = await ac.post(N8N_WEBHOOK_URL, json=data, headers={"Content-Type": "application/json"})
+            if r.status_code >= 400:
+                # one quick retry
+                await ac.post(N8N_WEBHOOK_URL, json=data, headers={"Content-Type": "application/json"})
     except Exception:
         # silent fail — never break the calculator if n8n is down
         pass
 
+# ---------- Endpoint ----------
 @app.post("/analyze")
-def analyze(payload: AnalyzePayload):
+def analyze(payload: AnalyzePayload, background_tasks: BackgroundTasks):
     try:
-        # fire-and-forget lead capture to n8n
-        threading.Thread(target=_send_lead_to_n8n, args=(payload,), daemon=True).start()
+        # queue lead capture to n8n (runs after response starts)
+        background_tasks.add_task(
+            send_lead_to_n8n_async,
+            {
+                "name": payload.name,
+                "email": payload.email,
+                "business_url": payload.business_url or "",
+                "website": payload.business_url or "",
+                "source": "Calculator",
+            },
+        )
 
         # Opening line
         opening = "<div style='font-weight:700;margin:2px 0 8px'>Thanks for using the Nykra CPA calculator. Here are your results.</div>"
@@ -485,6 +497,9 @@ def analyze(payload: AnalyzePayload):
             f"{_to_html(s2to5)}"
             f"</div>"
         )
-        return {"result_html": html, "plain_text": f"Thanks for using the Nykra CPA calculator. Here are your results.\n\n[s1]\n{re.sub('<[^<]+?>','',s1_html)}\n\n[s2-5]\n{s2to5}"}
+        return {
+            "result_html": html,
+            "plain_text": f"Thanks for using the Nykra CPA calculator. Here are your results.\n\n[s1]\n{re.sub('<[^<]+?>','',s1_html)}\n\n[s2-5]\n{s2to5}"
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model error: {e}") 
+        raise HTTPException(status_code=500, detail=f"Model error: {e}")
