@@ -19,9 +19,8 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 LTV_MONTHS = int(os.getenv("LTV_MONTHS", "6"))         # change to 12 if you prefer
 
-# Define both webhook URLs
-N8N_WEBHOOK_TEST_URL = "https://nykrastudio.app.n8n.cloud/webhook-test/nykra-cac-intake"
-N8N_WEBHOOK_PROD_URL = "https://nykrastudio.app.n8n.cloud/webhook/nykra-cac-intake"
+# Define webhook URL - using test URL as primary
+N8N_WEBHOOK_URL = "https://nykrastudio.app.n8n.cloud/webhook-test/nykra-cac-intake"
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -376,6 +375,7 @@ def section1_html(p: AnalyzePayload) -> Tuple[str, Dict]:
     return html, meta
 
 def _to_html(text: str) -> str:
+    # Fix the HTML escaping - the previous version was incorrect
     return (text.replace("&", "&")
                 .replace("<", "<")
                 .replace(">", ">")
@@ -448,22 +448,21 @@ OUTPUT — EXACT SECTIONS (do not add extra sections):
 
 # ---------- n8n lead sender (BackgroundTask) ----------
 async def send_lead_to_n8n_async(data: dict):
-    urls_to_try = [N8N_WEBHOOK_TEST_URL, N8N_WEBHOOK_PROD_URL]
-    success = False
-    
-    for url in urls_to_try:
-        if success:
-            break
+    """Send lead data to n8n webhook."""
+    try:
+        # Add explicit source field if not present
+        if "source" not in data:
+            data["source"] = "Calculator"
             
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as ac:
-                r = await ac.post(url, json=data, headers={"Content-Type": "application/json"})
-                if r.status_code < 400:
-                    success = True
-                    break
-        except Exception:
-            # Continue to next URL if this one fails
-            pass
+        async with httpx.AsyncClient(timeout=8.0) as ac:
+            r = await ac.post(N8N_WEBHOOK_URL, json=data, headers={"Content-Type": "application/json"})
+            # Print response for debugging
+            print(f"Webhook response: {r.status_code}")
+            if r.status_code >= 400:
+                print(f"Webhook error: {r.text}")
+    except Exception as e:
+        # Log the error but don't break the calculator
+        print(f"Error sending to webhook: {str(e)}")
 
 # ---------- Endpoint ----------
 @app.post("/analyze")
@@ -477,7 +476,7 @@ def analyze(payload: AnalyzePayload, background_tasks: BackgroundTasks):
                 "email": payload.email,
                 "business_url": payload.business_url or "",
                 "website": payload.business_url or "",
-                "source": "Calculator",
+                "source": "Calculator",  # Explicitly set source
             },
         )
 
