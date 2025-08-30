@@ -112,7 +112,7 @@ def get_business_type(business_description: str) -> str:
     else:
         return "business"
 
-async def get_gpt_assumptions(platform: str, industry: str, price: float, recurring: bool, business_description: str) -> dict:
+def get_gpt_assumptions(platform: str, industry: str, price: float, recurring: bool, business_description: str) -> dict:
     """Use GPT to get more accurate CPC and conversion rate assumptions"""
     try:
         # Fallback values in case API call fails
@@ -141,7 +141,8 @@ Business Description: {business_description}
         # Add industry-specific context
         if detected_industry == "healthcare":
             prompt += """
-Healthcare advertising has specific compliance requirements and typically higher CPCs.
+Healthcare advertising has specific compliance requirements and typically higher CPCs (often $3-6).
+For mental health services, conversion rates are typically lower (0.5-1.5%) due to privacy concerns and decision complexity.
 For recurring services like therapy, consider the lifetime value across multiple sessions.
 A typical therapy client might attend 8-12 sessions on average.
 """
@@ -170,7 +171,8 @@ Where:
 - ltv_multiplier is how many times the initial price a customer is worth over their lifetime (for recurring services)
 """
 
-        response = await openai.ChatCompletion.acreate(
+        # Use the synchronous version of the API call
+        response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a digital marketing analytics expert who provides precise numerical estimates."},
@@ -181,7 +183,7 @@ Where:
         )
         
         # Extract JSON from response
-        content = response.choices[0].message.content.strip()
+        content = response.choices[0].message["content"].strip()
         # Find JSON in the response (in case GPT adds explanatory text)
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
@@ -202,18 +204,21 @@ Where:
         if ltv_multiplier < 1:
             ltv_multiplier = max(1, 6 if recurring else 1)  # Default 6 months for recurring
             
-        # Apply price-based conversion rate adjustment if GPT didn't account for it
+        # Apply industry-specific overrides if GPT didn't provide realistic values
+        if detected_industry == "healthcare" and cpc < 2.5:
+            cpc = 3.5  # Healthcare typically has higher CPCs
+        if detected_industry == "healthcare" and conversion_rate > 0.015:
+            conversion_rate = 0.01  # Healthcare typically has lower conversion rates
+        if detected_industry == "healthcare" and recurring and ltv_multiplier < 5:
+            ltv_multiplier = 8  # Average therapy client attends ~8 sessions
+            
+        # Apply price-based conversion rate adjustment
         if price > 5000 and conversion_rate > 0.01:
             conversion_rate = min(conversion_rate, 0.01)
+        elif price > 1000 and conversion_rate > 0.02:
+            conversion_rate = min(conversion_rate, 0.02)
         
-        # Set default LTV multipliers by industry if not provided
-        if ltv_multiplier <= 1 and recurring:
-            if detected_industry == "healthcare":
-                ltv_multiplier = 8  # Average therapy client attends ~8 sessions
-            elif detected_industry == "saas":
-                ltv_multiplier = 12  # 12 month average retention
-            else:
-                ltv_multiplier = 6  # 6 month default
+        print(f"GPT estimates for {platform} in {detected_industry}: CPC=${cpc}, Conv={conversion_rate}, LTV={ltv_multiplier}")
         
         return {
             'cpc': cpc,
@@ -223,8 +228,17 @@ Where:
         
     except Exception as e:
         print(f"GPT API error: {str(e)}")
-        # Fallback to the original method if GPT fails
-        return get_platform_assumptions(platform, industry)
+        # Use industry-specific fallbacks instead of generic ones
+        industry = detect_industry(business_description)
+        if industry == "healthcare":
+            return {'cpc': 3.5, 'conversion_rate': 0.01, 'ltv_multiplier': 8 if recurring else 1}
+        elif industry == "saas":
+            return {'cpc': 4.0, 'conversion_rate': 0.015, 'ltv_multiplier': 12 if recurring else 1}
+        elif industry == "finance":
+            return {'cpc': 5.0, 'conversion_rate': 0.01, 'ltv_multiplier': 3 if recurring else 1}
+        else:
+            # Generic fallback with platform differences
+            return get_platform_assumptions(platform, industry)
 
 def get_platform_assumptions(platform: str, industry: str) -> dict:
     """Get CPC and conversion rate assumptions based on platform and industry (fallback method)"""
@@ -265,7 +279,7 @@ def get_platform_assumptions(platform: str, industry: str) -> dict:
     
     return assumptions
 
-async def calculate_roas_analysis(platforms: str, price: float, industry: str, recurring: bool, business_description: str) -> str:
+def calculate_roas_analysis(platforms: str, price: float, industry: str, recurring: bool, business_description: str) -> str:
     """Calculate ROAS analysis for given platforms"""
     if not platforms:
         platforms = "Meta"
@@ -275,7 +289,7 @@ async def calculate_roas_analysis(platforms: str, price: float, industry: str, r
     
     for platform in platform_list:
         # Use GPT for more accurate assumptions
-        assumptions = await get_gpt_assumptions(platform, industry, price, recurring, business_description)
+        assumptions = get_gpt_assumptions(platform, industry, price, recurring, business_description)
         cpc = assumptions['cpc']
         conv_rate = assumptions['conversion_rate']
         ltv_multiplier = assumptions['ltv_multiplier']
@@ -295,7 +309,7 @@ async def calculate_roas_analysis(platforms: str, price: float, industry: str, r
         if recurring and ltv_multiplier > 1:
             ltv = price * ltv_multiplier
             ltv_roas = ltv / cac if cac > 0 else 0
-            analysis += f", LTV-ROAS ≈ {ltv_roas:.1f}x (over {ltv_multiplier:.0f} transactions)"
+            analysis += f", LTV-ROAS ≈ {ltv_roas:.1f}x (over {ltv_multiplier:.0f} sessions)"
         
         analysis += f" {worth_it}.\n"
         
@@ -455,7 +469,7 @@ def address_struggle(struggle: str, business_description: str, price: float) -> 
     if "no sales" in struggle_lower or "not working" in struggle_lower:
         response += "no sales yet can feel discouraging, but it's exactly where testing pays off. We need to confirm offer-market fit and optimize your funnel. "
         response += "Start with a clear, low-friction offer and track your key metrics closely. "
-    elif "expensive" in struggle_lower or "budget" in struggle_lower:
+    elif "expensive" in struggle_lower or "budget" in struggle_lower or "cost" in struggle_lower:
         response += "testing can feel expensive, but small, focused tests will save money long-term. "
         response += "Start with minimal budgets to validate your approach before scaling. "
     elif "social media" in struggle_lower or "keep up" in struggle_lower:
@@ -494,7 +508,7 @@ async def analyze_calculator(request: CalculatorRequest):
         result_text += "1. Return on Ad Spend\n"
         result_text += "We'll use realistic CPC and conversion assumptions for your business & platforms, then calculate CAC (cost to win 1 customer) and ROAS. These are starting-point estimates; refine with your real data.\n\n"
         
-        roas_analysis = await calculate_roas_analysis(
+        roas_analysis = calculate_roas_analysis(
             request.ad_platforms or "Meta", 
             price, 
             request.business_description or "", 
