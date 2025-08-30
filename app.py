@@ -91,19 +91,20 @@ def _parse_price_details(item_price_text: Optional[str], recurring_text: Optiona
     """
     Determine upfront (setup), monthly (recurring), and avg_sale for ROAS-at-purchase.
     Priority:
+      - avg_sale: directly use the first number from item_price_text
       - upfront: numbers labelled near setup/upfront/project/website/refresh/initial; fallback largest >= 200
       - monthly: explicit recurring_price if given; else labelled near month/mo/maintenance/retainer/subscription; fallback 30..1500 not equal to upfront
-      - avg_sale: directly use the first number from item_price_text
     """
-    upfront_keys = ["setup", "upfront", "project", "website", "refresh", "initial", "one-off", "once"]
-    monthly_keys = ["per month", "month", "mo", "monthly", "maintenance", "retainer", "subscription"]
-
     # First, extract the main sale value directly from item_price_text
     avg_sale = None
     if item_price_text:
         nums = _nums_in(item_price_text)
         if nums:
-            avg_sale = nums[0][0]  # Use the first number found
+            # Use the first number found as the primary sale value
+            avg_sale = nums[0][0]
+
+    upfront_keys = ["setup", "upfront", "project", "website", "refresh", "initial", "one-off", "once"]
+    monthly_keys = ["per month", "month", "mo", "monthly", "maintenance", "retainer", "subscription"]
 
     s = item_price_text or ""
     pairs = _nums_in(s)
@@ -124,9 +125,9 @@ def _parse_price_details(item_price_text: Optional[str], recurring_text: Optiona
         monthlies = [recurring_explicit]
 
     # Fallbacks
-    if not upfronts:
+    if not upfronts and pairs:
         upfronts = [v for v, _ in pairs if v >= 200]
-    if not monthlies:
+    if not monthlies and pairs:
         monthlies = [v for v, _ in pairs if 30 <= v <= 1500 and v not in upfronts]
 
     upfront = max(upfronts) if upfronts else None
@@ -134,14 +135,14 @@ def _parse_price_details(item_price_text: Optional[str], recurring_text: Optiona
         try:
             monthly = float(statistics.median(monthlies))
         except statistics.StatisticsError:
-            monthly = float(monthlies[0])
+            monthly = float(monthlies[0]) if monthlies else None
     else:
         monthly = None
 
     # If avg_sale is still None, fall back to upfront
     if avg_sale is None and upfront is not None:
         avg_sale = upfront
-
+    
     return {"upfront": upfront, "monthly": monthly, "avg_sale": avg_sale}
 
 def _fmt_money(x: float) -> str:
@@ -239,11 +240,9 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
     monthly = price_info["monthly"]
     avg_sale = price_info["avg_sale"]
     
-    # Ensure we're using the correct sale price
-    sale_price = avg_sale  # Prioritize the directly extracted value
-    if sale_price is None:
-        sale_price = upfront  # Fall back to upfront if needed
-        
+    # Ensure we're using the correct sale price - prioritize avg_sale
+    sale_price = avg_sale  # This should be the first number from item_price_text
+    
     has_recurring = monthly is not None
 
     plats = _platforms_list(p.ad_platforms)
@@ -272,7 +271,8 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
 
         line = f"- <b>{plat.title()}</b> in {industry_type}: CPC ≈ {_fmt_money(cpc)}, conv ≈ {conv*100:.1f}% → ~{clicks_per_sale} clicks ≈ CAC {_fmt_money(cac)} per sale."
         if sale_price:
-            line += f" At {'setup price' if upfront else 'sale value'} {_fmt_money(sale_price)} → ROAS ≈ {roas:,.2f}x"
+            # Use sale_price directly, not upfront
+            line += f" At sale value {_fmt_money(sale_price)} → ROAS ≈ {roas:,.2f}x"
             if verdict:
                 margin = sale_price - (cac or 0)
                 sign = "+" if margin >= 0 else "−"
@@ -506,13 +506,4 @@ def analyze(payload: AnalyzePayload, background_tasks: BackgroundTasks):
             f"<div class='nykra-calc-result' style='line-height:1.55;color:#e8eaed'>"
             f"{opening}"
             f"{s1_html}"
-            f"<div style='font-weight:700;margin:14px 0 8px'>2–5) Plan & Guidance</div>"
-            f"{_to_html(s2to5)}"
-            f"</div>"
-        )
-        return {
-            "result_html": html,
-            "plain_text": f"Thanks for using the Nykra CPA calculator. Here are your results.\n\n[s1]\n{re.sub('<[^<]+?>','',s1_html)}\n\n[s2-5]\n{s2to5}"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model error: {e}")
+            f"<div style='font-weight:700;margin:14px 0 8px'>2–
