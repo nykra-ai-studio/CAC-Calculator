@@ -18,7 +18,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 LTV_MONTHS = int(os.getenv("LTV_MONTHS", "6"))         # change to 12 if you prefer
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")         # e.g. https://nykrastudio.app.n8n.cloud/webhook/nykra-cac-intake
+N8N_WEBHOOK_URL = "https://nykrastudio.app.n8n.cloud/webhook/nykra-cac-intake"  # Hardcoded URL as requested
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -128,16 +128,15 @@ def _parse_price_details(item_price_text: Optional[str], recurring_text: Optiona
     else:
         monthly = None
 
-    if upfront is not None:
-        avg_sale = upfront
+    # Use the first number from item_price_text as avg_sale if available
+    if pairs:
+        avg_sale = pairs[0][0]
     else:
-        if pairs:
-            try:
-                avg_sale = float(statistics.median([v for v, _ in pairs]))
-            except statistics.StatisticsError:
-                avg_sale = pairs[0][0]
-        else:
-            avg_sale = None
+        avg_sale = None
+
+    # If upfront is present, use it as avg_sale only if avg_sale is not already set
+    if upfront is not None and avg_sale is None:
+        avg_sale = upfront
 
     return {"upfront": upfront, "monthly": monthly, "avg_sale": avg_sale}
 
@@ -248,7 +247,9 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
 
     rows = []
     meta = {"platforms": []}
-    location = p.business_location or "your region"
+    
+    # Don't use location for industry assumptions
+    industry_type = "your industry"
 
     for plat in plats:
         cpc, conv = _assumptions_for(plat, is_srv, ticket, finite, has_recurring)
@@ -262,7 +263,7 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
         verdict = None
         if roas is not None: verdict = "worth testing" if roas >= 1.0 else "not worth it yet"
 
-        line = f"- <b>{plat.title()}</b> in {location}: CPC ≈ {_fmt_money(cpc)}, conv ≈ {conv*100:.1f}% → ~{clicks_per_sale} clicks ≈ CAC {_fmt_money(cac)} per sale."
+        line = f"- <b>{plat.title()}</b> in {industry_type}: CPC ≈ {_fmt_money(cpc)}, conv ≈ {conv*100:.1f}% → ~{clicks_per_sale} clicks ≈ CAC {_fmt_money(cac)} per sale."
         if sale_price:
             line += f" At {'setup price' if upfront else 'sale value'} {_fmt_money(sale_price)} → ROAS ≈ {roas:,.2f}x"
             if verdict:
@@ -273,7 +274,7 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
             line += " Add an average sale or setup price to judge ROAS precisely."
 
         if ltv_roas is not None:
-            line += f"<br/>&nbsp;&nbsp;↳ {LTV_MONTHS}-month LTV view: {_fmt_money(ltv)} / {_fmt_money(cac)} ≈ {ltv_roas:,.2f}x."
+            line += f"<br/>  ↳ {LTV_MONTHS}-month LTV view: {_fmt_money(ltv)} / {_fmt_money(cac)} ≈ {ltv_roas:,.2f}x."
 
         rows.append(line)
 
@@ -361,16 +362,16 @@ def choose_archetype(p: AnalyzePayload, meta: Dict) -> Dict:
 
 def section1_html(p: AnalyzePayload) -> Tuple[str, Dict]:
     header = "<div style='font-weight:700;margin:2px 0 8px'>1) Return on Ad Spend</div>"
-    intro = ("We’ll use realistic CPC and conversion assumptions for your business & platforms, then calculate CAC (cost to win 1 customer) and ROAS. "
+    intro = ("We'll use realistic CPC and conversion assumptions for your business & platforms, then calculate CAC (cost to win 1 customer) and ROAS. "
              "These are starting-point estimates; refine with your real data.")
     rows_html, meta = compute_platform_rows(p)
     html = header + f"<div style='opacity:.9;line-height:1.6'>{intro}</div><div style='margin-top:10px;line-height:1.6'>{rows_html}</div>"
     return html, meta
 
 def _to_html(text: str) -> str:
-    return (text.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
+    return (text.replace("&", "&")
+                .replace("<", "<")
+                .replace(">", ">")
                 .replace("\n", "<br/>"))
 
 def build_prompt_for_sections_2_to_5(p: AnalyzePayload, meta: Dict, plan: Dict) -> str:
@@ -440,8 +441,6 @@ OUTPUT — EXACT SECTIONS (do not add extra sections):
 
 # ---------- n8n lead sender (BackgroundTask) ----------
 async def send_lead_to_n8n_async(data: dict):
-    if not N8N_WEBHOOK_URL:
-        return
     try:
         async with httpx.AsyncClient(timeout=8.0) as ac:
             r = await ac.post(N8N_WEBHOOK_URL, json=data, headers={"Content-Type": "application/json"})
