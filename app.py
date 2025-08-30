@@ -2,18 +2,20 @@
 # - Section 1 (ROAS per platform) computed here (no model math)
 # - GPT writes Sections 2–5 using our numbers & guardrails
 
-import os, re, statistics, math
+import os, re, statistics, math, threading
 from typing import Optional, List, Tuple, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from openai import OpenAI
+import httpx
 
 # ---------- Config ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 LTV_MONTHS = int(os.getenv("LTV_MONTHS", "6"))  # change to 12 if you prefer
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # e.g., https://nykrastudio.app.n8n.cloud/webhook/nykra-cac-intake
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -133,7 +135,6 @@ def _fmt_money(x: float) -> str:
         return "$0"
     if x >= 1000:
         return "${:,.0f}".format(x)
-    # keep one decimal below 1000 if it has .5 etc.
     return "${:,.0f}".format(x) if float(int(x)) == x else "${:,.1f}".format(x)
 
 def _platforms_list(ad_platforms: Optional[str]) -> List[str]:
@@ -143,7 +144,6 @@ def _platforms_list(ad_platforms: Optional[str]) -> List[str]:
     if any(k in t for k in ["meta", "facebook", "instagram"]): plats.append("meta")
     if any(k in t for k in ["google", "search"]): plats.append("google")
     if "tiktok" in t: plats.append("tiktok")
-    # de-dupe while preserving order
     out, seen = [], set()
     for p in plats:
         if p not in seen:
@@ -164,7 +164,6 @@ def _is_finite(offer: Optional[str], desc: Optional[str]) -> bool:
 
 def _ticket_band(upfront: Optional[float], desc: Optional[str]) -> str:
     if upfront is None:
-        # infer from words
         s = (desc or "").lower()
         if any(k in s for k in ["enterprise", "premium", "custom build", "solar", "sauna", "renovation", "website"]):
             return "high"
@@ -175,47 +174,36 @@ def _ticket_band(upfront: Optional[float], desc: Optional[str]) -> str:
     return "premium"
 
 def _assumptions_for(platform: str, is_service: bool, ticket: str, finite: bool, has_recurring: bool) -> Tuple[float, float]:
-    """
-    Return (CPC $, conversion fraction).
-    Conservative, static heuristics (no GPT). Tuned by platform + business style.
-    """
-    # Google: higher intent, pricier CPC, better conv for services/high-ticket
+    """Return (CPC $, conversion fraction). Conservative, static heuristics (no GPT)."""
     if platform == "google":
         if finite:
-            return (4.0, 0.012)                    # event keywords, moderate intent
+            return (4.0, 0.012)
         if is_service:
-            if ticket in ("high", "premium"): return (8.0, 0.015)   # 1.5%
+            if ticket in ("high", "premium"): return (8.0, 0.015)
             if ticket == "mid": return (4.5, 0.015)
             return (3.0, 0.012)
-        # ecommerce
         if ticket == "low": return (2.0, 0.012)
         return (3.0, 0.012)
 
-    # Meta: cheaper CPC, lower initial conv; finite offers convert better with urgency
     if platform == "meta":
-        if finite: return (2.5, 0.012)             # urgency helps
+        if finite: return (2.5, 0.012)
         if is_service:
-            if ticket in ("high", "premium"): return (3.2, 0.004)   # 0.4%
-            return (2.2, 0.008)                    # 0.8%
-        # ecommerce
-        if ticket == "low": return (1.2, 0.010)    # 1.0%
+            if ticket in ("high", "premium"): return (3.2, 0.004)
+            return (2.2, 0.008)
+        if ticket == "low": return (1.2, 0.010)
         return (1.8, 0.012)
 
-    # TikTok: low CPC, lower conv unless visual/lifestyle or finite
     if platform == "tiktok":
         if finite: return (1.6, 0.010)
         if is_service:
             if ticket in ("high", "premium"): return (2.0, 0.0035)
             return (1.6, 0.006)
-        # ecommerce
         if ticket == "low": return (0.9, 0.008)
         return (1.2, 0.009)
 
-    # Default fallback
     return (2.0, 0.010)
 
 def _best_intent_platform(is_service: bool, ticket: str, finite: bool) -> str:
-    # choose most likely "intent winner" for initial 60/40 split
     if finite:
         return "meta"
     if is_service or ticket in ("high", "premium"):
@@ -225,16 +213,13 @@ def _best_intent_platform(is_service: bool, ticket: str, finite: bool) -> str:
 def _safe_float(s: Optional[str]) -> Optional[float]:
     if not s: return None
     try:
-        # pull first number if it's a string like "$500"
         vals = _nums_in(s)
         return vals[0][0] if vals else None
     except: return None
 
 # ---------- core builders ----------
 def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
-    """
-    Compute Section 1 lines and return (html_lines, meta dict with numbers for later sections).
-    """
+    """Compute Section 1 lines and return (html_lines, meta dict with numbers for later sections)."""
     price_info = _parse_price_details(p.item_price, p.recurring_price)
     upfront = price_info["upfront"]
     monthly = price_info["monthly"]
@@ -248,7 +233,6 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
     ticket = _ticket_band(sale_price, p.business_description)
 
     if not plats:
-        # Default platform if none provided:
         plats = ["google"] if is_srv or ticket in ("high", "premium") else ["meta"]
 
     rows = []
@@ -271,7 +255,6 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
         if sale_price:
             line += f" At {'setup price' if upfront else 'sale value'} {_fmt_money(sale_price)} → ROAS ≈ {roas:,.2f}x"
             if verdict:
-                # compute margin on purchase
                 margin = sale_price - (cac or 0)
                 sign = "+" if margin >= 0 else "−"
                 line += f" ({sign}{_fmt_money(abs(margin))} per sale) → <b>{verdict}</b>."
@@ -295,14 +278,12 @@ def compute_platform_rows(p: AnalyzePayload) -> Tuple[str, Dict]:
             "verdict": verdict,
         })
 
-    # winner/loser note
     if len(meta["platforms"]) >= 2 and all(pl["roas"] is not None for pl in meta["platforms"]):
         best = max(meta["platforms"], key=lambda d: d["roas"])
         worst = min(meta["platforms"], key=lambda d: d["roas"])
         if best["name"] != worst["name"]:
             rows.append(f"→ Right now <b>{best['name'].title()}</b> looks stronger than {worst['name'].title()} under these assumptions.")
 
-    # Echo prices used
     echo_bits = []
     if upfront is not None: echo_bits.append(f"setup: {_fmt_money(upfront)}")
     if monthly is not None: echo_bits.append(f"recurring: {_fmt_money(monthly)}/mo")
@@ -325,7 +306,7 @@ def choose_archetype(p: AnalyzePayload, meta: Dict) -> Dict:
 
     if finite:
         archetype = "finite"
-        curve = [0.30, 0.40, 0.30, 0.00]  # final 72h handled in narrative
+        curve = [0.30, 0.40, 0.30, 0.00]
     elif (is_srv and (ticket in ("high", "premium")) and not has_recurring):
         archetype = "high_durable"
         curve = [0.25, 0.25, 0.25, 0.25]
@@ -339,17 +320,14 @@ def choose_archetype(p: AnalyzePayload, meta: Dict) -> Dict:
         archetype = "generic_mid"
         curve = [0.25, 0.25, 0.25, 0.25]
 
-    # Budget guidance
-    # min test spend per platform: aim for ~8 CACs or $300 floor
     min_per_plat = []
     for pl in meta["platforms"]:
         cac = pl["cac"] or 300.0
         min_per_plat.append(max(cac * 8.0, 300.0))
-    baseline_weekly = sum(min_per_plat) / 4.0  # spread first month test over 4 weeks
+    baseline_weekly = sum(min_per_plat) / 4.0
     weekly_low = max(200.0, baseline_weekly * 0.7)
     weekly_high = baseline_weekly * 1.3
 
-    # Platform split: 60/40 toward likely winner
     likely = _best_intent_platform(is_srv, ticket, finite)
     chosen = [pl["name"] for pl in meta["platforms"]] or [likely]
     if len(chosen) == 1:
@@ -365,7 +343,6 @@ def choose_archetype(p: AnalyzePayload, meta: Dict) -> Dict:
             else:
                 split = {likely: 1.0}
         else:
-            # even split if our likely isn't chosen
             per = 1.0 / len(chosen)
             split = {c: per for c in chosen}
 
@@ -391,7 +368,6 @@ def _to_html(text: str) -> str:
                 .replace("\n", "<br/>"))
 
 def build_prompt_for_sections_2_to_5(p: AnalyzePayload, meta: Dict, plan: Dict) -> str:
-    # pack numbers for the model (read-only)
     price = meta.get("price_used", {})
     sale_price = price.get("sale_price")
     upfront = price.get("upfront")
@@ -456,9 +432,30 @@ OUTPUT — EXACT SECTIONS (do not add extra sections):
 - 3–5 bullets maximum, tailored to their type (finite, high-ticket durable, recurring service, low-ticket ecom).
 """
 
+# ---------- n8n lead sender (fire-and-forget) ----------
+def _send_lead_to_n8n(payload: AnalyzePayload):
+    if not N8N_WEBHOOK_URL:
+        return
+    data = {
+        "name": payload.name,
+        "email": payload.email,
+        "business_url": payload.business_url or "",
+        "website": payload.business_url or "",
+        "source": "Calculator"
+    }
+    try:
+        with httpx.Client(timeout=2.5) as client_http:
+            client_http.post(N8N_WEBHOOK_URL, json=data)
+    except Exception:
+        # silent fail — never break the calculator if n8n is down
+        pass
+
 @app.post("/analyze")
 def analyze(payload: AnalyzePayload):
     try:
+        # fire-and-forget lead capture to n8n
+        threading.Thread(target=_send_lead_to_n8n, args=(payload,), daemon=True).start()
+
         # Opening line
         opening = "<div style='font-weight:700;margin:2px 0 8px'>Thanks for using the Nykra CPA calculator. Here are your results.</div>"
 
@@ -490,4 +487,4 @@ def analyze(payload: AnalyzePayload):
         )
         return {"result_html": html, "plain_text": f"Thanks for using the Nykra CPA calculator. Here are your results.\n\n[s1]\n{re.sub('<[^<]+?>','',s1_html)}\n\n[s2-5]\n{s2to5}"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model error: {e}")
+        raise HTTPException(status_code=500, detail=f"Model error: {e}") 
