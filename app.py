@@ -299,8 +299,19 @@ def calculate_roas_analysis(platforms: str, price: float, industry: str, recurri
         cac = clicks_needed * cpc
         initial_roas = price / cac if cac > 0 else 0
         
-        # Determine if it's worth it
-        worth_it = "worth it" if initial_roas >= 3 or (recurring and price * ltv_multiplier / cac >= 3) else "not worth it"
+        # Calculate LTV-ROAS for recurring services
+        ltv_roas = 0
+        if recurring and ltv_multiplier > 1:
+            ltv = price * ltv_multiplier
+            ltv_roas = ltv / cac if cac > 0 else 0
+        
+        # Determine if it's worth it - with lower threshold for recurring
+        if recurring and ltv_multiplier > 1:
+            # For recurring services, use LTV-ROAS with 2x threshold
+            worth_it = "worth it" if ltv_roas >= 2 else "not worth it"
+        else:
+            # For one-time purchases, use initial ROAS with 3x threshold
+            worth_it = "worth it" if initial_roas >= 3 else "not worth it"
         
         # Basic analysis
         analysis += f"{platform.title()} in your industry: CPC ≈ ${cpc:.2f}, conv ≈ {conv_rate*100:.1f}% → ~{clicks_needed:.0f} clicks ≈ CAC ${cac:.0f} per sale. At sale value ${price:.0f} → ROAS ≈ {initial_roas:.1f}x"
@@ -308,12 +319,12 @@ def calculate_roas_analysis(platforms: str, price: float, industry: str, recurri
         # Add LTV analysis for recurring
         if recurring and ltv_multiplier > 1:
             ltv = price * ltv_multiplier
-            ltv_roas = ltv / cac if cac > 0 else 0
             analysis += f", LTV-ROAS ≈ {ltv_roas:.1f}x (over {ltv_multiplier:.0f} sessions)"
         
         analysis += f" {worth_it}.\n"
         
-        if worth_it == "not worth it" and not (recurring and price * ltv_multiplier / cac >= 3):
+        # Only add improvement notes if truly not worth it
+        if worth_it == "not worth it":
             if recurring:
                 analysis += "Notes: Consider optimizing your retention strategy to increase customer lifetime value, or bundling services to increase initial transaction value.\n"
             else:
@@ -550,7 +561,16 @@ async def analyze_calculator(request: CalculatorRequest):
         result_text += "5. Summary & Notes:\n"
         if request.recurring:
             result_text += "- For recurring service: focus on lifetime value and customer retention metrics.\n"
-        result_text += f"- Expected CAC target: Keep under ${price * 0.3:.0f} for healthy ROAS.\n"
+            
+            # For recurring services, base CAC target on LTV
+            industry = detect_industry(request.business_description or "")
+            ltv_multiplier = 8 if industry == "healthcare" else 6  # Default multipliers
+            ltv = price * ltv_multiplier
+            result_text += f"- Expected CAC target: Keep under ${ltv * 0.5:.0f} for healthy LTV-ROAS.\n"
+        else:
+            # For one-time purchases, base CAC target on initial price
+            result_text += f"- Expected CAC target: Keep under ${price * 0.3:.0f} for healthy ROAS.\n"
+            
         result_text += "- Track key metrics: Cost per click, conversion rate, and customer acquisition cost.\n"
         result_text += "- Start small, test consistently, and scale what works.\n"
         
@@ -573,3 +593,4 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
