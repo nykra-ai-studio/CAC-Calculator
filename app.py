@@ -506,4 +506,13 @@ def analyze(payload: AnalyzePayload, background_tasks: BackgroundTasks):
             f"<div class='nykra-calc-result' style='line-height:1.55;color:#e8eaed'>"
             f"{opening}"
             f"{s1_html}"
-            f"<div style='font-weight:700;margin:14px 0 8px'>2–
+            f"<div style='font-weight:700;margin:14px 0 8px'>2–5) Plan & Guidance</div>"
+            f"{_to_html(s2to5)}"
+            f"</div>"
+        )
+        return {
+            "result_html": html,
+            "plain_text": f"Thanks for using the Nykra CPA calculator. Here are your results.\n\n[s1]\n{re.sub('<[^<]+?>','',s1_html)}\n\n[s2-5]\n{s2to5}"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model error: {e}")
